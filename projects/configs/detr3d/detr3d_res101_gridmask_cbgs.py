@@ -20,7 +20,7 @@ class_names = [
 ]
 
 input_modality = dict(
-    use_lidar=True,
+    use_lidar=False,
     use_camera=True,
     use_radar=False,
     use_map=False,
