@@ -1,11 +1,8 @@
-import torch
-
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
-
 
 @DETECTORS.register_module()
 class Detr3D(MVXTwoStageDetector):
@@ -40,7 +37,7 @@ class Detr3D(MVXTwoStageDetector):
         """Extract features of images."""
         B = img.size(0)
         if img is not None:
-            input_shape = img.shape[-2:]
+            input_shape = img.shape[-2:]#bs nchw
             # update real input shape of each single img
             for img_meta in img_metas:
                 img_meta.update(input_shape=input_shape)
@@ -51,7 +48,7 @@ class Detr3D(MVXTwoStageDetector):
                 B, N, C, H, W = img.size()
                 img = img.view(B * N, C, H, W)
             if self.use_grid_mask:
-                img = self.grid_mask(img)
+                img = self.grid_mask(img)       # mask out some grids
             img_feats = self.img_backbone(img)
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
@@ -75,8 +72,7 @@ class Detr3D(MVXTwoStageDetector):
                           pts_feats,
                           gt_bboxes_3d,
                           gt_labels_3d,
-                          img_metas,
-                          gt_bboxes_ignore=None):
+                          img_metas):
         """Forward function for point cloud branch.
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -112,45 +108,26 @@ class Detr3D(MVXTwoStageDetector):
             return self.forward_test(**kwargs)
 
     def forward_train(self,
-                      points=None,
-                      img_metas=None,
-                      gt_bboxes_3d=None,
-                      gt_labels_3d=None,
-                      gt_labels=None,
-                      gt_bboxes=None,
-                      img=None,
-                      proposals=None,
-                      gt_bboxes_ignore=None,
-                      img_depth=None,
-                      img_mask=None):
+                      img_metas,
+                      gt_bboxes_3d,
+                      gt_labels_3d,
+                      img):
         """Forward training function.
         Args:
-            points (list[torch.Tensor], optional): Points of each sample.
-                Defaults to None.
             img_metas (list[dict], optional): Meta information of each sample.
-                Defaults to None.
             gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`], optional):
-                Ground truth 3D boxes. Defaults to None.
+                Ground truth 3D boxes.
             gt_labels_3d (list[torch.Tensor], optional): Ground truth labels
-                of 3D boxes. Defaults to None.
-            gt_labels (list[torch.Tensor], optional): Ground truth labels
-                of 2D boxes in images. Defaults to None.
-            gt_bboxes (list[torch.Tensor], optional): Ground truth 2D boxes in
-                images. Defaults to None.
+                of 3D boxes.
             img (torch.Tensor optional): Images of each sample with shape
-                (N, C, H, W). Defaults to None.
-            proposals ([list[torch.Tensor], optional): Predicted proposals
-                used for training Fast RCNN. Defaults to None.
-            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
-                2D boxes in images to be ignored. Defaults to None.
+                (N, C, H, W).
         Returns:
             dict: Losses of different branches.
         """
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
-                                            gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore)
+                                            gt_labels_3d, img_metas)
         losses.update(losses_pts)
         return losses
     
@@ -161,11 +138,6 @@ class Detr3D(MVXTwoStageDetector):
                     name, type(var)))
         img = [img] if img is None else img
         return self.simple_test(img_metas[0], img[0], **kwargs)
-        # if num_augs == 1:
-        #     img = [img] if img is None else img
-        #     return self.simple_test(None, img_metas[0], img[0], **kwargs)
-        # else:
-        #     return self.aug_test(None, img_metas, img, **kwargs)
 
     def simple_test_pts(self, x, img_metas, rescale=False):
         """Test function of point cloud branch."""
@@ -173,10 +145,10 @@ class Detr3D(MVXTwoStageDetector):
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [
-            bbox3d2result(bboxes, scores, labels)
-            for bboxes, scores, labels in bbox_list
+            bbox3d2result(bboxes, scores, labels)       # to CPU
+            for bboxes, scores, labels in bbox_list     #for each in batch
         ]
-        return bbox_results
+        return bbox_results #list of dict(bboxes scores labels) in one frame
     
     def simple_test(self, img_metas, img=None, rescale=False):
         """Test function without augmentaiton."""
@@ -185,32 +157,7 @@ class Detr3D(MVXTwoStageDetector):
         bbox_list = [dict() for i in range(len(img_metas))]
         bbox_pts = self.simple_test_pts(
             img_feats, img_metas, rescale=rescale)
+        
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
-        return bbox_list
-
-    def aug_test_pts(self, feats, img_metas, rescale=False):
-        feats_list = []
-        for j in range(len(feats[0])):
-            feats_list_level = []
-            for i in range(len(feats)):
-                feats_list_level.append(feats[i][j])
-            feats_list.append(torch.stack(feats_list_level, -1).mean(-1))
-        outs = self.pts_bbox_head(feats_list, img_metas)
-        bbox_list = self.pts_bbox_head.get_bboxes(
-            outs, img_metas, rescale=rescale)
-        bbox_results = [
-            bbox3d2result(bboxes, scores, labels)
-            for bboxes, scores, labels in bbox_list
-        ]
-        return bbox_results
-
-    def aug_test(self, img_metas, imgs=None, rescale=False):
-        """Test function with augmentaiton."""
-        img_feats = self.extract_feats(img_metas, imgs)
-        img_metas = img_metas[0]
-        bbox_list = [dict() for i in range(len(img_metas))]
-        bbox_pts = self.aug_test_pts(img_feats, img_metas, rescale)
-        for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
-            result_dict['pts_bbox'] = pts_bbox
-        return bbox_list
+        return bbox_list    #list of dict of pts_bbox=dict(bboxes scores labels), len()=batch size

@@ -1,10 +1,9 @@
 _base_ = [
-    '../../../mmdetection3d/configs/_base_/datasets/nus-3d.py',
-    '../../../mmdetection3d/configs/_base_/default_runtime.py'
+    '../../../configs/_base_/datasets/nus-3d.py',
+    '../../../configs/_base_/default_runtime.py'
 ]
 
-plugin=True
-plugin_dir='projects/mmdet3d_plugin/'
+custom_imports = dict(imports=['projects.mmdet3d_plugin'])
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
@@ -27,7 +26,7 @@ input_modality = dict(
     use_external=False)
 
 model = dict(
-    type='Detr3D',
+    type='Detr3D_old',
     use_grid_mask=True,
     img_backbone=dict(
         type='ResNet',
@@ -114,45 +113,8 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'NuScenesDataset'
-data_root = 'data/nuscenes/'
+data_root = 'data/nus_rc2/'
 
-file_client_args = dict(backend='disk')
-
-db_sampler = dict(
-    data_root=data_root,
-    info_path=data_root + 'nuscenes_dbinfos_train.pkl',
-    rate=1.0,
-    prepare=dict(
-        filter_by_difficulty=[-1],
-        filter_by_min_points=dict(
-            car=5,
-            truck=5,
-            bus=5,
-            trailer=5,
-            construction_vehicle=5,
-            traffic_cone=5,
-            barrier=5,
-            motorcycle=5,
-            bicycle=5,
-            pedestrian=5)),
-    classes=class_names,
-    sample_groups=dict(
-        car=2,
-        truck=3,
-        construction_vehicle=7,
-        bus=4,
-        trailer=6,
-        barrier=2,
-        motorcycle=6,
-        bicycle=6,
-        pedestrian=2,
-        traffic_cone=2),
-    points_loader=dict(
-        type='LoadPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=5,
-        use_dim=[0, 1, 2, 3, 4],
-        file_client_args=file_client_args))
 
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -188,22 +150,29 @@ data = dict(
     samples_per_gpu=1,
     workers_per_gpu=4,
     train=dict(
-        type='CBGSDataset',
-        dataset=dict(
-            type=dataset_type,
-            data_root=data_root,
-            ann_file=data_root + 'nuscenes_infos_train.pkl',
-            pipeline=train_pipeline,
-            classes=class_names,
-            modality=input_modality,
-            test_mode=False,
-            use_valid_flag=True,
-            # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
-            # and box_type_3d='Depth' in sunrgbd and scannet dataset.
-            box_type_3d='LiDAR'),
-    ),
-    val=dict(pipeline=test_pipeline, classes=class_names, modality=input_modality),
-    test=dict(pipeline=test_pipeline, classes=class_names, modality=input_modality))
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=data_root + 'nuscenes_infos_train.pkl',
+        pipeline=train_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        test_mode=False,
+        use_valid_flag=True,
+        # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
+        # and box_type_3d='Depth' in sunrgbd and scannet dataset.
+        box_type_3d='LiDAR'),
+   val=dict(
+        data_root=data_root,
+        ann_file=data_root + 'nuscenes_infos_val.pkl',
+        pipeline=test_pipeline, 
+        classes=class_names, 
+        modality=input_modality),
+    test=dict(
+        data_root=data_root,
+        ann_file=data_root + 'nuscenes_infos_val.pkl',
+        pipeline=test_pipeline, 
+        classes=class_names, 
+        modality=input_modality))
 
 optimizer = dict(
     type='AdamW', 
@@ -223,6 +192,31 @@ lr_config = dict(
     min_lr_ratio=1e-3)
 total_epochs = 24
 evaluation = dict(interval=2, pipeline=test_pipeline)
-
+checkpoint_config = dict(interval=1, max_keep_ckpts=1)
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 load_from='pretrained/fcos3d.pth'
+
+# The model is trained on mmdet3d-v0.17.3
+# and is evaluated on mmdet3d-v1.0.0rc2
+# Evaluating bboxes of pts_bbox
+# mAP: 0.3470
+# mATE: 0.7653
+# mASE: 0.2678
+# mAOE: 0.3920
+# mAVE: 0.8759
+# mAAE: 0.2108
+# NDS: 0.4223
+# Eval time: 187.8s
+
+# Per-class results:
+# Object Class    AP      ATE     ASE     AOE     AVE     AAE
+# car     0.546   0.544   0.152   0.070   0.911   0.208
+# truck   0.286   0.834   0.212   0.113   1.004   0.231
+# bus     0.346   0.871   0.196   0.116   2.061   0.382
+# trailer 0.167   1.106   0.233   0.549   0.687   0.093
+# construction_vehicle    0.082   1.061   0.449   0.962   0.120   0.384
+# pedestrian      0.424   0.700   0.295   0.512   0.462   0.194
+# motorcycle      0.341   0.710   0.259   0.488   1.291   0.176
+# bicycle 0.278   0.697   0.275   0.588   0.473   0.019
+# traffic_cone    0.529   0.526   0.313   nan     nan     nan
+# barrier 0.471   0.603   0.292   0.131   nan     nan
