@@ -1,11 +1,14 @@
-import torch
+from typing import List
 
-from mmdet.core.bbox.builder import BBOX_ASSIGNERS
-from mmdet.core.bbox.assigners import AssignResult
-from mmdet.core.bbox.assigners import BaseAssigner
-from mmdet.core.bbox.match_costs import build_match_cost
-from mmdet.models.utils.transformer import inverse_sigmoid
-from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+import torch
+from mmdet3d.registry import TASK_UTILS
+from mmdet.models.task_modules.assigners import AssignResult  # check
+from mmdet.models.task_modules.assigners import BaseAssigner
+from mmengine.structures import InstanceData
+from torch import Tensor
+
+# from mmdet.core.bbox.match_costs import build_match_cost
+from .util import normalize_bbox
 
 try:
     from scipy.optimize import linear_sum_assignment
@@ -13,49 +16,46 @@ except ImportError:
     linear_sum_assignment = None
 
 
-@BBOX_ASSIGNERS.register_module()
+@TASK_UTILS.register_module()
 class HungarianAssigner3D(BaseAssigner):
     """Computes one-to-one matching between predictions and ground truth.
+
     This class computes an assignment between the targets and the predictions
-    based on the costs. The costs are weighted sum of three components:
-    classification cost, regression L1 cost and regression iou cost. The
-    targets don't include the no_object, so generally there are more
-    predictions than targets. After the one-to-one matching, the un-matched
-    are treated as backgrounds. Thus each query prediction will be assigned
-    with `0` or a positive integer indicating the ground truth index:
+    based on the costs. The costs are weighted sum of some components.
+    For DETR3D the costs are weighted sum of classification cost, regression L1
+    cost and regression iou cost. The targets don't include the no_object, so
+    generally there are more predictions than targets. After the one-to-one
+    matching, the un-matched are treated as backgrounds. Thus each query
+    prediction will be assigned with `0` or a positive integer indicating the
+    ground truth index:
+
     - 0: negative sample, no assigned gt
     - positive integer: positive sample, index (1-based) of assigned gt
+
     Args:
-        cls_weight (int | float, optional): The scale factor for classification
-            cost. Default 1.0.
-        bbox_weight (int | float, optional): The scale factor for regression
-            L1 cost. Default 1.0.
-        iou_weight (int | float, optional): The scale factor for regression
-            iou cost. Default 1.0.
-        iou_calculator (dict | optional): The config for the iou calculation.
-            Default type `BboxOverlaps2D`.
-        iou_mode (str | optional): "iou" (intersection over union), "iof"
-                (intersection over foreground), or "giou" (generalized
-                intersection over union). Default "giou".
+        cls_cost (obj:`ConfigDict`) : Match cost configs.
+        reg_cost.
+        iou_cost.
+        pc_range: perception range of the detector
     """
 
     def __init__(self,
                  cls_cost=dict(type='ClassificationCost', weight=1.),
                  reg_cost=dict(type='BBoxL1Cost', weight=1.0),
                  iou_cost=dict(type='IoUCost', weight=0.0),
-                 pc_range=None):
-        self.cls_cost = build_match_cost(cls_cost)
-        self.reg_cost = build_match_cost(reg_cost)
-        self.iou_cost = build_match_cost(iou_cost)
+                 pc_range: List = None):
+        self.cls_cost = TASK_UTILS.build(cls_cost)
+        self.reg_cost = TASK_UTILS.build(reg_cost)
+        self.iou_cost = TASK_UTILS.build(iou_cost)
         self.pc_range = pc_range
 
     def assign(self,
-               bbox_pred,
-               cls_pred,
-               gt_bboxes, 
-               gt_labels,
+               bbox_pred: Tensor,
+               cls_pred: Tensor,
+               gt_bboxes: Tensor,
+               gt_labels: Tensor,
                gt_bboxes_ignore=None,
-               eps=1e-7):
+               eps=1e-7) -> AssignResult:
         """Computes one-to-one matching based on the weighted costs.
         This method assign each query prediction to a ground truth or
         background. The `assigned_gt_inds` with -1 means don't care,
@@ -70,23 +70,22 @@ class HungarianAssigner3D(BaseAssigner):
            and assign the corresponding gt index (plus 1) to it.
         Args:
             bbox_pred (Tensor): Predicted boxes with normalized coordinates
-                (cx, cy, w, h), which are all in range [0, 1]. Shape
-                [num_query, 4].
+                (cx,cy,l,w,cz,h,sin(φ),cos(φ),v_x,v_y) which are all in range [0, 1].
+                Shape [num_query, 10].
             cls_pred (Tensor): Predicted classification logits, shape
                 [num_query, num_class].
             gt_bboxes (Tensor): Ground truth boxes with unnormalized
-                coordinates (x1, y1, x2, y2). Shape [num_gt, 4].
+                coordinates (cx,cy,cz,l,w,h,φ,v_x,v_y). Shape [num_gt, 9].
             gt_labels (Tensor): Label of `gt_bboxes`, shape (num_gt,).
             gt_bboxes_ignore (Tensor, optional): Ground truth bboxes that are
                 labelled as `ignored`. Default None.
-            eps (int | float, optional): A value added to the denominator for
-                numerical stability. Default 1e-7.
+            eps (int | float, optional): unused parameter
         Returns:
             :obj:`AssignResult`: The assigned result.
         """
         assert gt_bboxes_ignore is None, \
             'Only case when gt_bboxes_ignore is None is supported.'
-        num_gts, num_bboxes = gt_bboxes.size(0), bbox_pred.size(0)
+        num_gts, num_bboxes = gt_bboxes.size(0), bbox_pred.size(0)  #9, 900
 
         # 1. assign -1 by default
         assigned_gt_inds = bbox_pred.new_full((num_bboxes, ),
@@ -100,19 +99,24 @@ class HungarianAssigner3D(BaseAssigner):
             if num_gts == 0:
                 # No ground truth, assign all to background
                 assigned_gt_inds[:] = 0
-            return AssignResult(
-                num_gts, assigned_gt_inds, None, labels=assigned_labels)
+            return AssignResult(num_gts,
+                                assigned_gt_inds,
+                                None,
+                                labels=assigned_labels)
 
         # 2. compute the weighted costs
         # classification and bboxcost.
-        cls_cost = self.cls_cost(cls_pred, gt_labels)
+        # # dev1.x interface alignment
+        pred_instances = InstanceData(scores=cls_pred)
+        gt_instances = InstanceData(labels=gt_labels)
+        cls_cost = self.cls_cost(pred_instances, gt_instances)
         # regression L1 cost
         normalized_gt_bboxes = normalize_bbox(gt_bboxes, self.pc_range)
         reg_cost = self.reg_cost(bbox_pred[:, :8], normalized_gt_bboxes[:, :8])
-      
+
         # weighted sum of above two costs
         cost = cls_cost + reg_cost
-        
+
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()
         if linear_sum_assignment is None:
@@ -130,5 +134,7 @@ class HungarianAssigner3D(BaseAssigner):
         # assign foregrounds based on matching results
         assigned_gt_inds[matched_row_inds] = matched_col_inds + 1
         assigned_labels[matched_row_inds] = gt_labels[matched_col_inds]
-        return AssignResult(
-            num_gts, assigned_gt_inds, None, labels=assigned_labels)
+        return AssignResult(num_gts,
+                            assigned_gt_inds,
+                            None,
+                            labels=assigned_labels)
