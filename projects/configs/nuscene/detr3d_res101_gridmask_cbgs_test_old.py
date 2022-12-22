@@ -1,10 +1,9 @@
 _base_ = [
-    '../../../mmdetection3d/configs/_base_/datasets/nus-3d.py',
-    '../../../mmdetection3d/configs/_base_/default_runtime.py'
+    '../../../configs/_base_/datasets/nus-3d.py',
+    '../../../configs/_base_/default_runtime.py'
 ]
 
-plugin=True
-plugin_dir='projects/mmdet3d_plugin/'
+custom_imports = dict(imports=['projects.mmdet3d_plugin'])
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
@@ -12,7 +11,7 @@ point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 voxel_size = [0.2, 0.2, 8]
 
 img_norm_cfg = dict(
-    mean=[103.530, 116.280, 123.675], std=[57.375, 57.120, 58.395], to_rgb=False)
+    mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
 # For nuScenes we usually do 10-class detection
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
@@ -24,23 +23,27 @@ input_modality = dict(
     use_camera=True,
     use_radar=False,
     use_map=False,
-    use_external=True)
+    use_external=False)
 
 model = dict(
-    type='Detr3D',
+    type='Detr3D_old',
     use_grid_mask=True,
     img_backbone=dict(
-        type='VoVNet',
-        spec_name='V-99-eSE',
-        norm_eval=True,
+        type='ResNet',
+        depth=101,
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
         frozen_stages=1,
-        input_ch=3,
-        out_features=['stage2', 'stage3', 'stage4', 'stage5']),
+        norm_cfg=dict(type='BN2d', requires_grad=False),
+        norm_eval=True,
+        style='caffe',
+        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False),
+        stage_with_dcn=(False, False, True, True)),
     img_neck=dict(
         type='FPN',
-        in_channels=[256, 512, 768, 1024],
+        in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        start_level=0,
+        start_level=1,
         add_extra_convs='on_output',
         num_outs=4,
         relu_before_extra_convs=True),
@@ -52,7 +55,6 @@ model = dict(
         sync_cls_avg_factor=True,
         with_box_refine=True,
         as_two_stage=False,
-        code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
         transformer=dict(
             type='Detr3DTransformer',
             decoder=dict(
@@ -111,45 +113,8 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'NuScenesDataset'
-data_root = 'data/nuscenes/'
+data_root = 'data/nus_rc2/'
 
-file_client_args = dict(backend='disk')
-
-db_sampler = dict(
-    data_root=data_root,
-    info_path=data_root + 'nuscenes_dbinfos_train.pkl',
-    rate=1.0,
-    prepare=dict(
-        filter_by_difficulty=[-1],
-        filter_by_min_points=dict(
-            car=5,
-            truck=5,
-            bus=5,
-            trailer=5,
-            construction_vehicle=5,
-            traffic_cone=5,
-            barrier=5,
-            motorcycle=5,
-            bicycle=5,
-            pedestrian=5)),
-    classes=class_names,
-    sample_groups=dict(
-        car=2,
-        truck=3,
-        construction_vehicle=7,
-        bus=4,
-        trailer=6,
-        barrier=2,
-        motorcycle=6,
-        bicycle=6,
-        pedestrian=2,
-        traffic_cone=2),
-    points_loader=dict(
-        type='LoadPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=5,
-        use_dim=[0, 1, 2, 3, 4],
-        file_client_args=file_client_args))
 
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -189,7 +154,7 @@ data = dict(
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
-            ann_file=data_root + 'nuscenes_infos_trainval.pkl',
+            ann_file=data_root + 'nuscenes_infos_train.pkl',
             pipeline=train_pipeline,
             classes=class_names,
             modality=input_modality,
@@ -199,8 +164,18 @@ data = dict(
             # and box_type_3d='Depth' in sunrgbd and scannet dataset.
             box_type_3d='LiDAR'),
     ),
-    val=dict(pipeline=test_pipeline, classes=class_names, modality=input_modality),
-    test=dict(pipeline=test_pipeline, classes=class_names, modality=input_modality))
+   val=dict(
+        data_root=data_root,
+        ann_file=data_root + 'nuscenes_infos_val.pkl',
+        pipeline=test_pipeline, 
+        classes=class_names, 
+        modality=input_modality),
+    test=dict(
+        data_root=data_root,
+        ann_file=data_root + 'nuscenes_infos_val.pkl',
+        pipeline=test_pipeline, 
+        classes=class_names, 
+        modality=input_modality))
 
 optimizer = dict(
     type='AdamW', 
@@ -222,6 +197,26 @@ total_epochs = 24
 evaluation = dict(interval=2, pipeline=test_pipeline)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-load_from='ckpts/dd3d_det_final.pth'
+load_from='pretrained/fcos3d.pth'
+# Evaluating bboxes of pts_bbox
+# mAP: 0.3493
+# mATE: 0.7161
+# mASE: 0.2683
+# mAOE: 0.3792
+# mAVE: 0.8417
+# mAAE: 0.1995
+# NDS: 0.4342
+# Eval time: 184.4s
 
-find_unused_parameters=True
+# Per-class results:
+# Object Class    AP      ATE     ASE     AOE     AVE     AAE
+# car     0.542   0.533   0.151   0.064   0.954   0.193
+# truck   0.285   0.774   0.208   0.093   1.017   0.239
+# bus     0.363   0.796   0.192   0.137   1.844   0.379
+# trailer 0.167   1.076   0.236   0.610   0.717   0.094
+# construction_vehicle    0.081   0.969   0.438   0.914   0.114   0.336
+# pedestrian      0.400   0.684   0.306   0.531   0.474   0.201
+# motorcycle      0.338   0.684   0.257   0.380   1.202   0.143
+# bicycle 0.261   0.631   0.280   0.582   0.411   0.012
+# traffic_cone    0.531   0.478   0.324   nan     nan     nan
+# barrier 0.525   0.536   0.291   0.102   nan     nan

@@ -32,26 +32,22 @@ class Detr3DHead(DETRHead):
                  transformer=None,
                  bbox_coder=None,
                  num_cls_fcs=2,
-                 code_weights=None,
+                 code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2], ## origin for nus
+                 code_size = 10,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
         if self.as_two_stage:
-            transformer['as_two_stage'] = self.as_two_stage
-        if 'code_size' in kwargs:
-            self.code_size = kwargs['code_size']
-        else:
-            self.code_size = 10
-        if code_weights is not None:
-            self.code_weights = code_weights
-        else:
-            self.code_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
-        
+            transformer['as_two_stage'] = self.as_two_stage        
+        self.code_size = code_size
+        self.code_weights = code_weights
+
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
         self.num_cls_fcs = num_cls_fcs - 1
         super(Detr3DHead, self).__init__(
             *args, transformer=transformer, **kwargs)
+
         self.code_weights = nn.Parameter(torch.tensor(
             self.code_weights, requires_grad=False), requires_grad=False)
 
@@ -101,7 +97,7 @@ class Detr3DHead(DETRHead):
             for m in self.cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
 
-    def forward(self, mlvl_feats, img_metas):
+    def forward(self, mlvl_feats, img_metas, **kwargs ):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -117,12 +113,12 @@ class Detr3DHead(DETRHead):
         """
 
         query_embeds = self.query_embedding.weight
-        
         hs, init_reference, inter_references = self.transformer(
             mlvl_feats,
             query_embeds,
             reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
             img_metas=img_metas,
+            **kwargs
         )
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
@@ -136,7 +132,6 @@ class Detr3DHead(DETRHead):
             reference = inverse_sigmoid(reference)
             outputs_class = self.cls_branches[lvl](hs[lvl])
             tmp = self.reg_branches[lvl](hs[lvl])
-
             # TODO: check the shape of reference
             assert reference.shape[-1] == 3
             tmp[..., 0:2] += reference[..., 0:2]
@@ -193,7 +188,7 @@ class Detr3DHead(DETRHead):
         """
 
         num_bboxes = bbox_pred.size(0)
-        # assigner and sampler
+        # assigner and sampler,PseudoSampler
         assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
                                              gt_labels, gt_bboxes_ignore)
         sampling_result = self.sampler.sample(assign_result, bbox_pred,
@@ -209,11 +204,12 @@ class Detr3DHead(DETRHead):
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
         # bbox targets
-        bbox_targets = torch.zeros_like(bbox_pred)[..., :9]
+        bbox_targets = torch.zeros_like(bbox_pred)[..., :self.code_size-1]#theta in gt_bbox here is still a single scalar
         bbox_weights = torch.zeros_like(bbox_pred)
-        bbox_weights[pos_inds] = 1.0
-
+        bbox_weights[pos_inds] = 1.0        #only matched query will learn from bbox coord
         # DETR
+        if sampling_result.pos_gt_bboxes.shape[0]==0: #fix empty gt bug in multi gpu training
+            sampling_result.pos_gt_bboxes = sampling_result.pos_gt_bboxes.reshape(0,self.code_size-1)
         bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
         return (labels, label_weights, bbox_targets, bbox_weights, 
                 pos_inds, neg_inds)
@@ -318,7 +314,6 @@ class Detr3DHead(DETRHead):
         cls_avg_factor = max(cls_avg_factor, 1)
         loss_cls = self.loss_cls(
             cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
-
         # Compute the average number of gt boxes accross all gpus, for
         # normalization purposes
         num_total_pos = loss_cls.new_tensor([num_total_pos])
@@ -327,16 +322,16 @@ class Detr3DHead(DETRHead):
         # regression L1 loss
         bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
         normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
-        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)      #neg_query is all 0, log(0) is NaN
         bbox_weights = bbox_weights * self.code_weights
 
         loss_bbox = self.loss_bbox(
-                bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+                bbox_preds[isnotnan, :self.code_size], normalized_bbox_targets[isnotnan, :self.code_size], bbox_weights[isnotnan, :self.code_size], avg_factor=num_total_pos)
 
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
         return loss_cls, loss_bbox
-    
+
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              gt_bboxes_list,
@@ -381,6 +376,7 @@ class Detr3DHead(DETRHead):
 
         num_dec_layers = len(all_cls_scores)
         device = gt_labels_list[0].device
+        # turn bottm center into gravity center, key step
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
             dim=1).to(device) for gt_bboxes in gt_bboxes_list]
@@ -390,7 +386,7 @@ class Detr3DHead(DETRHead):
         all_gt_bboxes_ignore_list = [
             gt_bboxes_ignore for _ in range(num_dec_layers)
         ]
-
+        #calculate loss for each decoder layer
         losses_cls, losses_bbox = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds,
             all_gt_bboxes_list, all_gt_labels_list, 
@@ -438,7 +434,7 @@ class Detr3DHead(DETRHead):
             preds = preds_dicts[i]
             bboxes = preds['bboxes']
             bboxes[:, 2] = bboxes[:, 2] - bboxes[:, 5] * 0.5
-            bboxes = img_metas[i]['box_type_3d'](bboxes, 9)
+            bboxes = img_metas[i]['box_type_3d'](bboxes, self.code_size-1)
             scores = preds['scores']
             labels = preds['labels']
             ret_list.append([bboxes, scores, labels])
